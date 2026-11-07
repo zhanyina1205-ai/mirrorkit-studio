@@ -1,5 +1,5 @@
 const {chromium}=require('playwright-core');
-const cheerio=require('cheerio');
+const {createRewriter,buildSnapshot}=require('./snapshot.cjs');
 const fs=require('node:fs/promises');
 const path=require('node:path');
 const crypto=require('node:crypto');
@@ -50,37 +50,36 @@ async function capture(record,dir,update,signal){
    const response=await page.goto(url,{waitUntil:'domcontentloaded',timeout:35000});
    if(!response||!response.ok())throw Error(`页面返回 HTTP ${response?.status()||'未知'}`);
    await page.waitForLoadState('networkidle',{timeout:8000}).catch(()=>{});
+   update({stage:'等待页面加载与开场动画完成'});
+   const isLoading = () => [...document.querySelectorAll('[class*=Loader],[class*=loader],[id*=loader]')].some(el=>{
+    const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+    return r.width>innerWidth*.5&&r.height>innerHeight*.5&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>.1;
+   });
+   let loadingIncomplete=false;
+   try{await page.waitForFunction(() => ![...document.querySelectorAll('[class*=Loader],[class*=loader],[id*=loader]')].some(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>innerWidth*.5&&r.height>innerHeight*.5&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>.1;}),null,{timeout:25000});}catch{loadingIncomplete=await page.evaluate(isLoading);}
+   if(loadingIncomplete)warnings.add('页面加载动画未完成，保存的画面可能仍为加载状态');
+   await page.waitForTimeout(1500);
    // Trigger common lazy loading without scrolling indefinitely.
    for(let i=0;i<5;i++){await page.evaluate(()=>window.scrollBy(0,700));await page.waitForTimeout(250);}
    await page.evaluate(()=>window.scrollTo(0,0));await page.waitForTimeout(500);
    const index=pages.length;const title=await page.title();
-   const metadata=await page.evaluate(()=>({description:document.querySelector('meta[name="description"]')?.content||'',links:[...document.querySelectorAll('a[href]')].map(a=>a.href),images:[...document.images].map(i=>i.currentSrc||i.src),fonts:[...new Set([...document.querySelectorAll('h1,h2,p,button')].slice(0,50).map(e=>getComputedStyle(e).fontFamily))]}));
+   const metadata=await page.evaluate(()=>({baseUrl:document.baseURI,canvasHeavy:[...document.querySelectorAll('canvas')].some(el=>{const r=el.getBoundingClientRect();return r.width*r.height>innerWidth*innerHeight*.25;}),description:document.querySelector('meta[name="description"]')?.content||'',links:[...document.querySelectorAll('a[href]')].map(a=>a.href),images:[...document.images].map(i=>i.currentSrc||i.src),fonts:[...new Set([...document.querySelectorAll('h1,h2,p,button')].slice(0,50).map(e=>getComputedStyle(e).fontFamily))]}));
    await page.evaluate(()=>{for(const img of document.images){if(img.currentSrc){img.setAttribute('src',img.currentSrc);img.removeAttribute('srcset');}}});
    const html=await page.content();await fs.writeFile(path.join(dir,`rendered-${index}.html`),html);
    await page.screenshot({path:path.join(dir,`screenshot-${index}.png`),fullPage:false,timeout:15000});
-   pages.push({url:page.url(),requestedUrl:url,title,description:metadata.description,fonts:metadata.fonts,file:index===0?'index.html':`page-${index}.html`,screenshot:`screenshot-${index}.png`});
-   if(index===0)update({title:title||new URL(url).hostname,description:metadata.description});
+   pages.push({url:page.url(),baseUrl:metadata.baseUrl,previewMode:metadata.canvasHeavy||loadingIncomplete?'screenshot':'html',loadingIncomplete,requestedUrl:url,title,description:metadata.description,fonts:metadata.fonts,file:index===0?'index.html':`page-${index}.html`,screenshot:`screenshot-${index}.png`});
+   if(metadata.canvasHeavy)warnings.add('此网站使用 Canvas / WebGL，离线预览改为画面快照，交互需在原站查看');
+   if(index===0)update({previewMode:metadata.canvasHeavy||loadingIncomplete?'screenshot':'html',loadingIncomplete,title:title||new URL(url).hostname,description:metadata.description});
    for(const link of metadata.links){try{const u=new URL(link);u.hash='';if(u.origin===new URL(record.url).origin&&!/\.(zip|pdf|mp4|exe|dmg)$/i.test(u.pathname)&&!visited.has(u.href)&&queue.length<50)queue.push(u.href);}catch{}}
   }catch(e){if(!pages.length)throw e;warnings.add(`部分子页面未完成：${e.message}`);}finally{await page.close().catch(()=>{});}
  }
  await Promise.allSettled([...pending]);if(signal.aborted)throw Error('已取消');
  update({stage:'正在生成离线预览与复刻资料',progress:90});
- function localize(value,base,prefix='assets/'){
-  if(!value||/^(data:|#)/i.test(value))return value;
-  try{const url=new URL(value,base);url.hash='';const page=pages.find(p=>p.url===url.href||p.requestedUrl===url.href);if(page)return prefix==='assets/'?page.file:'../'+page.file;const asset=assets.get(url.href);if(asset)return prefix+asset.file;return '';}catch{return '';}
- }
- function cssRewrite(css,base,prefix){return css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi,(_,q,value)=>`url("${localize(value,base,prefix)||'data:,'}")`).replace(/@import\s+(['"])(.*?)\1/gi,(_,q,value)=>`@import "${localize(value,base,prefix)||'data:,'}"`);}
+ const {cssRewrite}=createRewriter(pages,assets);
  for(const a of assets.values())if(a.type==='text/css'){const f=path.join(files,a.file);await fs.writeFile(f,cssRewrite(await fs.readFile(f,'utf8'),a.url,''));}
  for(let i=0;i<pages.length;i++){
-  const p=pages[i];const $=cheerio.load(await fs.readFile(path.join(dir,`rendered-${i}.html`),'utf8'));
-  $('script,base,iframe,object,embed,meta[http-equiv],link[rel="preload"],link[rel="modulepreload"]').remove();
-  $('*').each((_,el)=>{for(const key of Object.keys(el.attribs||{}))if(key.startsWith('on')||['integrity','nonce','crossorigin','srcset','action','formaction','ping'].includes(key))$(el).removeAttr(key);
-   for(const key of ['src','poster','href','xlink:href']){const value=$(el).attr(key);if(!value)continue;const local=localize(value,p.url);if(local)$(el).attr(key,local);else{$(el).removeAttr(key);if(key==='src')warnings.add('预览中有未捕获的资源');}}
-   const style=$(el).attr('style');if(style)$(el).attr('style',cssRewrite(style,p.url,'assets/'));
-  });
-  $('style').each((_,el)=>$(el).text(cssRewrite($(el).text(),p.url,'assets/')));
-  $('head').prepend('<meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src \'self\' data:; style-src \'self\' \'unsafe-inline\'; font-src \'self\' data:; media-src \'self\' data:; form-action \'none\'; base-uri \'none\'">');
-  await fs.writeFile(path.join(dir,p.file),$.html());
+  const p=pages[i];const html=await fs.readFile(path.join(dir,`rendered-${i}.html`),'utf8');
+  await fs.writeFile(path.join(dir,p.file),buildSnapshot(html,p,pages,assets,warnings));
  }
  const manifest={version:1,source:record.url,capturedAt:new Date().toISOString(),pages,assets:[...assets.values()],warnings:[...warnings],mode:'static-offline-snapshot'};
  await fs.writeFile(path.join(dir,'manifest.json'),JSON.stringify(manifest,null,2));

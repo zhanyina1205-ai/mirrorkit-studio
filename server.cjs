@@ -62,7 +62,7 @@ const server=http.createServer(async(req,res)=>{try{
 const preview=http.createServer((req,res)=>{try{
  if(!trusted(req,PREVIEW)){res.writeHead(403);return res.end();}
  const parts=decodeURIComponent(new URL(req.url,'http://localhost').pathname).split('/').filter(Boolean),id=parts.shift();site(id);
- const relative=parts.join('/');if(!/^(index\.html|page-\d+\.html|assets\/[a-f0-9]{24}\.[a-z0-9]+)$/.test(relative)){res.writeHead(404);return res.end();}
+ const relative=parts.join('/');if(!/^(index\.html|page-\d+\.html|screenshot-\d+\.png|assets\/[a-f0-9]{24}\.[a-z0-9]+)$/.test(relative)){res.writeHead(404);return res.end();}
  stream(res,path.join(DATA,'sites',id,relative),{'Content-Security-Policy':"default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self' data:; form-action 'none'; base-uri 'none'; sandbox allow-same-origin"});
  }catch{res.writeHead(404);res.end();}});
 server.listen(PORT,'127.0.0.1',()=>console.log(`MirrorKit Studio: http://127.0.0.1:${PORT}`));preview.listen(PREVIEW,'127.0.0.1');
